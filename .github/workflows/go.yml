@@ -24,11 +24,11 @@ jobs:
     - name: Build for x86_64 Linux
       run: |
         mkdir artifacts/
-        GOARCH=amd64 GOOS=linux go build -v -o artifacts/auto-cf-protector-amd64 ./...
+        CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -v -o artifacts/auto-cf-protector-amd64 ./...
 
     - name: Build for ARM64 Linux
       run: |
-        GOARCH=arm64 GOOS=linux go build -v -o artifacts/auto-cf-protector-arm64 ./...
+        CGO_ENABLED=0 GOARCH=arm64 GOOS=linux go build -v -o artifacts/auto-cf-protector-arm64 ./...
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
