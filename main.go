@@ -15,10 +15,64 @@ import (
 	"time"
 
 	"github.com/cloudflare/cloudflare-go"
-	"github.com/fatih/color"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/load"
 )
+
+type Config struct {
+	Hostname              string
+	SlackWebhookURL       string
+	CloudflareAPIKey      string
+	CloudflareZoneID      string
+	CPULimit              float64
+	Client                *cloudflare.API
+	InitialSecurityLevel  string
+	CurrentSecurityLevel  string
+	UnderAttackActive     bool
+	ConsecutiveAlertCount int
+	AlertDelayCount       int
+}
+
+type SlackMessage struct {
+	Text string `json:"text"`
+}
+
+func sendMessage(cfg *Config, message string) {
+	printToConsole(cfg, message)
+	if strings.TrimSpace(cfg.SlackWebhookURL) != "" {
+		err := sendSlackNotification(cfg, message)
+		if err != nil {
+			printToConsole(cfg, fmt.Sprintf("Failed to send Slack notification: %v", err))
+		}
+	}
+}
+
+func printToConsole(cfg *Config, message string) {
+	fmt.Printf("[%s] %s\n", cfg.Hostname, message)
+}
+
+func sendSlackNotification(cfg *Config, message string) error {
+	slackMsg := SlackMessage{
+		Text: fmt.Sprintf("`[%s]` %s", cfg.Hostname, message),
+	}
+
+	messageBytes, err := json.Marshal(slackMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Slack message: %w", err)
+	}
+
+	resp, err := http.Post(cfg.SlackWebhookURL, "application/json", bytes.NewBuffer(messageBytes))
+	if err != nil {
+		return fmt.Errorf("failed to send Slack notification: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Slack webhook response: %s", resp.Status)
+	}
+
+	return nil
+}
 
 func loadCheck() (load.AvgStat, int, error) {
 	loadAvg, err := load.Avg()
@@ -37,7 +91,7 @@ func loadCheck() (load.AvgStat, int, error) {
 func initializeCloudflare(cfApiKey string) (*cloudflare.API, error) {
 	client, err := cloudflare.NewWithAPIToken(cfApiKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create CloudFlare client: %w", err)
+		return nil, fmt.Errorf("failed to create Cloudflare client: %w", err)
 	}
 	return client, nil
 }
@@ -45,13 +99,15 @@ func initializeCloudflare(cfApiKey string) (*cloudflare.API, error) {
 func checkCloudflareSecurityLevel(client *cloudflare.API, cfZoneId string) (string, error) {
 	settings, err := client.ZoneSettings(context.Background(), cfZoneId)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch zone settings: %w", err)
+		return "", fmt.Errorf("error fetching zone settings: %w", err)
 	}
 
 	var currentSecurityLevel string
 	for _, setting := range settings.Result {
 		if setting.ID == "security_level" {
-			currentSecurityLevel = setting.Value.(string)
+			if val, ok := setting.Value.(string); ok {
+				currentSecurityLevel = val
+			}
 			break
 		}
 	}
@@ -78,100 +134,95 @@ func updateCloudflareSecurityLevel(client *cloudflare.API, cfZoneId, securityLev
 	return nil
 }
 
-func handleSigint(client *cloudflare.API, cfZoneId, initialSecurityLevel string, currentSecurityLevel *string) {
+func handleSigint(cfg *Config) {
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	<-sigChan
 
-	fmt.Printf("\nReceived SIGINT (process kill), restoring CloudFlare Security Level to '%v'\n", initialSecurityLevel)
+	printToConsole(cfg, fmt.Sprintf("Received termination signal, restoring Cloudflare Security Level to '%v'", cfg.InitialSecurityLevel))
 
-	if initialSecurityLevel == *currentSecurityLevel {
-		fmt.Printf("CloudFlare Security Level the same. Exiting...\n")
+	if cfg.InitialSecurityLevel == cfg.CurrentSecurityLevel {
+		printToConsole(cfg, "Cloudflare Security Level is unchanged. Exiting.")
 		os.Exit(0)
 	}
 
-	err := updateCloudflareSecurityLevel(client, cfZoneId, initialSecurityLevel)
+	err := updateCloudflareSecurityLevel(cfg.Client, cfg.CloudflareZoneID, cfg.InitialSecurityLevel)
 	if err != nil {
-		fmt.Printf("Failed to restore initial Security Level: '%v'\n", err)
+		printToConsole(cfg, fmt.Sprintf("Failed to restore initial Security Level: '%v'", err))
 		os.Exit(1)
 	} else {
-		fmt.Printf("CloudFlare Security Level restored to '%s'\n", initialSecurityLevel)
+		printToConsole(cfg, fmt.Sprintf("Cloudflare Security Level restored to '%s'", cfg.InitialSecurityLevel))
 		os.Exit(0)
 	}
 }
 
-func sendSlackNotification(webhookURL, message string) error {
-	type SlackMessage struct {
-		Text string `json:"text"`
-	}
+func periodicSecurityCheck(cfg *Config) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 
-	slackMsg := SlackMessage{
-		Text: message,
+	for {
+		select {
+		case <-ticker.C:
+			currentLevel, err := checkCloudflareSecurityLevel(cfg.Client, cfg.CloudflareZoneID)
+			if err != nil {
+				printToConsole(cfg, fmt.Sprintf("Error checking Cloudflare Security Level: %v", err))
+				continue
+			}
+			cfg.CurrentSecurityLevel = currentLevel
+		}
 	}
-
-	messageBytes, err := json.Marshal(slackMsg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal Slack message: %w", err)
-	}
-
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(messageBytes))
-	if err != nil {
-		return fmt.Errorf("failed to send Slack notification: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Slack webhook response: %s", resp.Status)
-	}
-
-	return nil
 }
 
 func main() {
-	red := color.New(color.FgRed).PrintfFunc()
-	green := color.New(color.FgGreen).PrintfFunc()
-	white := color.New(color.FgHiWhite).PrintfFunc()
-
 	slackWebhookURL := flag.String("w", "", "Slack Webhook URL for notifications")
-	cfApiKey := flag.String("k", "", "CloudFlare API token")
-	cfZoneId := flag.String("z", "", "CloudFlare Zone ID")
+	cfApiKey := flag.String("k", "", "Cloudflare API token")
+	cfZoneId := flag.String("z", "", "Cloudflare Zone ID")
 	cpuLimit := flag.Float64("l", 80, "Set the CPU load percentage limit")
 
 	flag.Parse()
 
 	fmt.Print("\x1bc")
 
-	//	if strings.TrimSpace(*slackWebhookURL) == "" {
-	//		red("Slack Webhook URL is not specified\n")
-	//		return
-	//	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatalf("Failed to get hostname: %v", err)
+	}
 
-	if strings.TrimSpace(*cfApiKey) == "" || strings.TrimSpace(*cfZoneId) == "" {
-		red("CloudFlare API variables are not specified\n")
+	cfg := &Config{
+		Hostname:              hostname,
+		SlackWebhookURL:       *slackWebhookURL,
+		CloudflareAPIKey:      *cfApiKey,
+		CloudflareZoneID:      *cfZoneId,
+		CPULimit:              *cpuLimit,
+		UnderAttackActive:     false,
+		ConsecutiveAlertCount: 0,
+		AlertDelayCount:       3,
+	}
+
+	if strings.TrimSpace(cfg.CloudflareAPIKey) == "" || strings.TrimSpace(cfg.CloudflareZoneID) == "" {
+		fmt.Printf("Cloudflare API variables are not specified\n")
 		return
 	}
 
-	client, err := initializeCloudflare(*cfApiKey)
-	if err != nil {
-		log.Fatal(err)
-	}
-	initialSecurityLevel, err := checkCloudflareSecurityLevel(client, *cfZoneId)
+	cfg.Client, err = initializeCloudflare(cfg.CloudflareAPIKey)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if initialSecurityLevel == "under_attack" {
-		white("CloudFlare Under Attack mode is already active. Exiting...\n")
+	cfg.InitialSecurityLevel, err = checkCloudflareSecurityLevel(cfg.Client, cfg.CloudflareZoneID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.CurrentSecurityLevel = cfg.InitialSecurityLevel
+
+	if cfg.InitialSecurityLevel == "under_attack" {
+		fmt.Printf("Cloudflare Under Attack mode is already active. Exiting...\n")
 		return
 	}
 
-	currentSecurityLevel := initialSecurityLevel
-	underAttackActive := false
-	consecutiveAlertCount := 0
-	alertDelayCount := 3
-
-	go handleSigint(client, *cfZoneId, initialSecurityLevel, &currentSecurityLevel)
+	go handleSigint(cfg)
+	go periodicSecurityCheck(cfg)
 
 	for {
 		loadAvg, cpuCount, err := loadCheck()
@@ -181,56 +232,50 @@ func main() {
 
 		loadPercentage := (loadAvg.Load1 / float64(cpuCount)) * 100
 
-		white("CPU Utilization\n")
-		if loadPercentage < *cpuLimit {
-			green("OK: CPU Load Percentage: %.2f%%. Limit - %.2f%%\n\n", loadPercentage, *cpuLimit)
-			white("Initial CloudFlare Security Level: %s\n", initialSecurityLevel)
-			white("Current CloudFlare Security Level: %s\n", currentSecurityLevel)
+		if loadPercentage < cfg.CPULimit {
+			printToConsole(cfg, fmt.Sprintf("OK: CPU Load Percentage: %.2f%%. Limit - %.2f%%", loadPercentage, cfg.CPULimit))
+			printToConsole(cfg, fmt.Sprintf("Initial Cloudflare Security Level: %s", cfg.InitialSecurityLevel))
+			printToConsole(cfg, fmt.Sprintf("Current Cloudflare Security Level: %s", cfg.CurrentSecurityLevel))
 
-			if underAttackActive {
-				white("Disabling Under Attack mode - ")
-				err := updateCloudflareSecurityLevel(client, *cfZoneId, initialSecurityLevel)
+			if cfg.UnderAttackActive {
+				printToConsole(cfg, "Disabling Under Attack mode")
+
+				err := updateCloudflareSecurityLevel(cfg.Client, cfg.CloudflareZoneID, cfg.InitialSecurityLevel)
 				if err != nil {
-					red("Failed to disable Under Attack mode: %v\n", err)
-					message := fmt.Sprintf("Failed to disable Under Attack mode")
-					err = sendSlackNotification(*slackWebhookURL, message)
+					sendMessage(cfg, fmt.Sprintf("Failed to disable Under Attack mode: %v", err))
 				} else {
-					green("OK\n")
-					underAttackActive = false
-					currentSecurityLevel = initialSecurityLevel
-					message := fmt.Sprintf("CloudFlare Security Level changed to `%s`", currentSecurityLevel)
-					err = sendSlackNotification(*slackWebhookURL, message)
+					cfg.UnderAttackActive = false
+					cfg.CurrentSecurityLevel = cfg.InitialSecurityLevel
+					sendMessage(cfg, fmt.Sprintf("CPU Load Percentage below limit: `%.2f%%`. Usage: `%.2f%%`. Cloudflare Security Level changed to `%s`", cfg.CPULimit, loadPercentage, cfg.CurrentSecurityLevel))
+
 				}
 			}
 
-			consecutiveAlertCount = 0
+			cfg.ConsecutiveAlertCount = 0
 		} else {
-			red("ALERT: CPU Load Percentage: %.2f%%. Limit - %.2f%%\n\n", loadPercentage, *cpuLimit)
-			white("Initial CloudFlare Security Level: %s\n", initialSecurityLevel)
-			white("Current CloudFlare Security Level: %s\n", currentSecurityLevel)
+			printToConsole(cfg, fmt.Sprintf("ALERT: CPU Load Percentage: %.2f%%. Limit - %.2f%%", loadPercentage, cfg.CPULimit))
+			printToConsole(cfg, fmt.Sprintf("Initial Cloudflare Security Level: %s", cfg.InitialSecurityLevel))
+			printToConsole(cfg, fmt.Sprintf("Current Cloudflare Security Level: %s", cfg.CurrentSecurityLevel))
 
-			consecutiveAlertCount++
+			cfg.ConsecutiveAlertCount++
 
-			if consecutiveAlertCount >= alertDelayCount && !underAttackActive {
-				white("Activating Under Attack CloudFlare mode after %d consecutive alerts - ", consecutiveAlertCount)
-				err := updateCloudflareSecurityLevel(client, *cfZoneId, "under_attack")
+			if cfg.ConsecutiveAlertCount >= cfg.AlertDelayCount && !cfg.UnderAttackActive {
+				printToConsole(cfg, fmt.Sprintf("Activating Under Attack Cloudflare mode after %d consecutive alerts", cfg.ConsecutiveAlertCount))
+
+				err := updateCloudflareSecurityLevel(cfg.Client, cfg.CloudflareZoneID, "under_attack")
 				if err != nil {
-					red("Failed to activate Under Attack mode: %v\n", err)
-					message := fmt.Sprintf("Failed to activate Under Attack mode")
-					err = sendSlackNotification(*slackWebhookURL, message)
+					sendMessage(cfg, fmt.Sprintf("Failed to activate Under Attack mode: %v", err))
 				} else {
-					green("OK\n")
-					underAttackActive = true
-					currentSecurityLevel = "under_attack"
-					message := fmt.Sprintf("CloudFlare Security Level changed to `%s`", currentSecurityLevel)
-					err = sendSlackNotification(*slackWebhookURL, message)
-					white("Sleeping for 3 minutes...")
-					time.Sleep(180 * time.Second)
+					cfg.UnderAttackActive = true
+					cfg.CurrentSecurityLevel = "under_attack"
+					sendMessage(cfg, fmt.Sprintf("CPU Load Percentage over limit: `%.2f%%`. Usage: `%.2f%%`. Cloudflare Security Level changed to `%s`", cfg.CPULimit, loadPercentage, cfg.CurrentSecurityLevel))
+					printToConsole(cfg, "Sleeping for 3 minutes...")
+					time.Sleep(3 * time.Minute)
 				}
 			}
 		}
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(3 * time.Second)
 		fmt.Print("\x1bc")
 	}
 }
