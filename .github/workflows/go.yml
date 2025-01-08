@@ -30,10 +30,6 @@ jobs:
       run: |
         GOARCH=arm64 GOOS=linux go build -v -o artifacts/auto-cf-protector-arm64 ./...
 
-    - name: Setting execution permissions
-      run: |
-        chmod +x artifacts/*
-
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
